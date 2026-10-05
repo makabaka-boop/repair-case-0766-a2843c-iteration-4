@@ -9,9 +9,11 @@
  * 一旦出现就必须通过结构校验，否则整份数据视为不可信。
  *
  * 结构之外，读取还会重放容量轨迹（hasConsistentCapacityTrajectory）：
- * 批次 id 必须唯一、每批累计用量不得超过额定容量、每条记录的
- * 登记后剩余量必须与按顺序累计的轨迹一致。轨迹自相矛盾的存档
- * （同 id 批次、超额批次、余量与汇总矛盾的记录）同样视为不可信：
+ * 批次 id 必须唯一、每批各阶段累计用量不得超过当时有效容量、每张更正凭证的
+ * 原容量与新容量必须与其签发阶段一致（新容量不得低于当时已登记用量），
+ * 每条记录的登记后剩余量必须等于按「凭证与用量实际发生顺序」分阶段重放的值
+ * ——不能拿更正后的最终容量反验早期记录。轨迹自相矛盾的存档
+ * （同 id 批次、超额批次、阶段不符的凭证、余量与汇总矛盾的记录）同样视为不可信：
  * 就地提示、不作为可写台账、也绝不写回覆盖浏览器中的原文。
  *
  * 跨标签并发（本模块的核心职责）：
@@ -35,9 +37,12 @@ import {
   isMixSourceSnapshot,
   recordUsage,
   createBatch,
+  correctCapacity,
+  type CapacityCorrection,
   type ChemicalBatch,
   type CommandResult,
   type CreateBatchInput,
+  type CorrectCapacityInput,
   type LedgerDeps,
   type LedgerState,
   type RecordUsageInput,
@@ -133,6 +138,39 @@ function parseRecord(value: unknown): UsageRecord | null {
 }
 
 /**
+ * 容量更正凭证逐字段结构校验。
+ * 原有效容量 / 新有效容量都必须是正的安全整数，原因是非空字符串，
+ * seq（全局稠密提交顺序）必须是正的安全整数；批次归属与分阶段容量轨迹
+ * （previousCapacity 是否匹配签发阶段、newCapacity 是否低于当时用量、
+ * seq 是否稠密对齐、记录 remainingAfter 是否符合所处阶段容量）
+ * 由 parseLedger 末尾的 hasConsistentCapacityTrajectory 统一重放把关。
+ */
+function parseCorrection(value: unknown): CapacityCorrection | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const candidate = value as Record<string, unknown>;
+  if (
+    !isNonEmptyString(candidate.id) ||
+    !isNonEmptyString(candidate.batchId) ||
+    !isPositiveInteger(candidate.previousCapacity) ||
+    !isPositiveInteger(candidate.newCapacity) ||
+    !isNonEmptyString(candidate.reason) ||
+    !isPositiveInteger(candidate.seq) ||
+    typeof candidate.createdAt !== 'string'
+  ) {
+    return null;
+  }
+  return {
+    id: candidate.id,
+    batchId: candidate.batchId,
+    previousCapacity: candidate.previousCapacity,
+    newCapacity: candidate.newCapacity,
+    reason: candidate.reason,
+    seq: candidate.seq,
+    createdAt: candidate.createdAt,
+  };
+}
+
+/**
  * 持久化文档：台账状态 + 单调递增的修订号。
  * revision 不属于领域状态（LedgerState），容量 / 记录推导与它无关。
  */
@@ -171,9 +209,23 @@ export function parseLedger(json: string): LedgerState | null {
     if (!record || !batchIds.has(record.batchId)) return null;
     records.push(record);
   }
-  const state: LedgerState = { batches, records };
-  // 容量轨迹是批次选择、历史余量、耗尽判断与后续写入的唯一依据：
-  // 同 id 批次、超过额定容量的累计用量、与累计不符的登记后剩余量
+
+  // 容量更正凭证为可选字段：旧版本台账没有它，按空数组照常读取；
+  // 一旦出现就必须是结构完整的数组，否则整份数据不可信。
+  let corrections: CapacityCorrection[] = [];
+  if (candidate.corrections !== undefined) {
+    if (!Array.isArray(candidate.corrections)) return null;
+    for (const item of candidate.corrections) {
+      const correction = parseCorrection(item);
+      if (!correction || !batchIds.has(correction.batchId)) return null;
+      corrections.push(correction);
+    }
+  }
+
+  const state: LedgerState = { batches, records, corrections };
+  // 分阶段容量轨迹是批次选择、历史余量、耗尽判断与后续写入的唯一依据：
+  // 同 id 批次、断裂 / 重号的凭证序号、签发阶段不符的凭证、超过各阶段有效
+  // 容量的累计用量、与所处阶段不符的登记后剩余量（如拿最终容量反验早期记录）
   // 都会让轨迹自相矛盾。这类存档即使逐字段类型合法也一律视为不可信
   // （按损坏处理：就地提示、不作为可写台账、绝不写回覆盖原文）。
   if (!hasConsistentCapacityTrajectory(state)) return null;
@@ -255,12 +307,14 @@ export function saveLedger(storage: StorageLike | undefined, state: LedgerState)
 /** 提交意图：在「读取时的最新台账」上重放一条领域命令。 */
 export type LedgerIntent =
   | { type: 'createBatch'; input: CreateBatchInput }
-  | { type: 'recordUsage'; input: RecordUsageInput };
+  | { type: 'recordUsage'; input: RecordUsageInput }
+  | { type: 'correctCapacity'; input: CorrectCapacityInput };
 
 /** 命令重放结果（携带命令产物，界面可据此选中新建批次等）。 */
 export type IntentResult =
   | { type: 'createBatch'; result: CommandResult<ChemicalBatch> }
-  | { type: 'recordUsage'; result: CommandResult<UsageRecord> };
+  | { type: 'recordUsage'; result: CommandResult<UsageRecord> }
+  | { type: 'correctCapacity'; result: CommandResult<CapacityCorrection> };
 
 export type CommitOutcome =
   | {
@@ -302,6 +356,9 @@ function replayIntent(ledger: LedgerState, intent: LedgerIntent, deps: LedgerDep
   if (intent.type === 'createBatch') {
     return { type: 'createBatch', result: createBatch(ledger, intent.input, deps) };
   }
+  if (intent.type === 'correctCapacity') {
+    return { type: 'correctCapacity', result: correctCapacity(ledger, intent.input, deps) };
+  }
   return { type: 'recordUsage', result: recordUsage(ledger, intent.input, deps) };
 }
 
@@ -342,7 +399,7 @@ export function commitLedger(
     return {
       ok: false,
       kind: 'conflict',
-      error: '台账已被其他页面更新，本次登记未写入；页面已刷新为最新台账，请核对后重新登记',
+      error: '台账已被其他页面更新，本次操作未写入；页面已刷新为最新台账，请核对后重新操作',
       doc: latest,
     };
   }

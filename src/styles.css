@@ -266,6 +266,21 @@ header h1 {
   font-style: normal;
 }
 
+/* 容量更正凭证：与使用记录同列表样式，但用左侧色带区分「凭证」而非用量 */
+.correction-list {
+  margin-bottom: 4px;
+}
+
+.correction-item {
+  border-left: 3px solid var(--accent);
+  padding-left: 10px;
+  background: var(--accent-soft);
+}
+
+.correction-item em {
+  flex-basis: 100%;
+}
+
 .panel {
   background: var(--panel);
   border: 1px solid var(--panel-border);

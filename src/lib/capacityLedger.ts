@@ -4,16 +4,19 @@
  * 与配液计算相互独立：这里跟踪一批药液按「等效胶片数」计的额定容量、
  * 逐次登记的处理用量与剩余容量，避免凭记忆继续使用已耗尽的药液。
  *
- * 契约 = 两个命令（纯函数，不修改传入状态，返回新状态）：
+ * 契约 = 三个命令（纯函数，不修改传入状态，返回新状态）：
  * - createBatch：创建带名称与额定容量的药液批次，可附带一份配液来源快照；
- * - recordUsage：向指定批次登记一次处理用量，写入前重新计算剩余量，
- *   剩余量 = 额定容量 − 该批全部已登记用量之和；登记后剩余为 0 即「已耗尽」。
+ * - recordUsage：向指定批次登记一次处理用量，写入前按**最新有效容量**重新计算剩余量，
+ *   剩余量 = 最新有效容量 − 该批全部已登记用量之和；登记后剩余为 0 即「已耗尽」；
+ * - correctCapacity：为容量台账追加一张不可修改的「容量更正凭证」，
+ *   把批次的有效容量改为新值（调增 / 调减均可），不改动批次创建容量与任何历史记录。
  *
- * 使用记录一旦写入不可修改：命令只追加、不更新、不删除；
- * 累计用量 / 剩余容量 / 状态均由记录推导，不单独存储。
- * hasConsistentCapacityTrajectory 校验一份状态能否按此轨迹完整重放，
- * 持久化层据此拒绝加载自相矛盾的存档（同 id 批次、超额用量、
- * 与累计不符的登记后剩余量）。
+ * 使用记录与更正凭证一旦写入均不可修改：命令只追加、不更新、不删除；
+ * 累计用量 / 有效容量 / 剩余容量 / 状态均由记录与凭证推导，不单独存储。
+ * 有效容量 = 批次创建容量 + 该批全部更正凭证的差额（无凭证时即创建容量）。
+ * hasConsistentCapacityTrajectory 校验一份状态能否按「凭证与用量实际发生顺序」
+ * 完整分阶段重放，持久化层据此拒绝加载自相矛盾的存档（同 id 批次、超额用量、
+ * 与各阶段容量不符的登记后剩余量、签发时容量对不上的凭证、断裂的提交顺序）。
  *
  * 配液来源快照（可选）：从配液计算结果区「存入容量台账」时，
  * 把同一次计算的稀释比例、目标总量、量筒容量、分罐数与浓缩液/清水体积
@@ -84,12 +87,53 @@ export interface UsageRecord {
   createdAt: string;
 }
 
+/**
+ * 容量更正凭证（不可修改，只能由 correctCapacity 追加）。
+ *
+ * 登记时发现批次的额定可处理胶片数填错时，用凭证把**有效容量**改为新值：
+ * 批次的创建容量（ChemicalBatch.capacity）与全部历史使用记录
+ * （含其 remainingAfter 快照）保持原样，之后的余量与新记录按最新有效容量计算。
+ *
+ * 凭证记录：所属批次、签发时的原有效容量、新有效容量、原因与提交顺序。
+ * seq 是「凭证与用量提交顺序」中的全局稠密序号（1..N），
+ * 存档校验据此把凭证精确插入使用记录之间，按各阶段容量重放，
+ * 而不是拿最终容量反验早期记录。
+ */
+export interface CapacityCorrection {
+  id: string;
+  batchId: string;
+  /** 凭证签发时该批次的原有效容量（正整数） */
+  previousCapacity: number;
+  /** 更正后的新有效容量（正整数，且不低于该批截至签发时的已登记用量） */
+  newCapacity: number;
+  /** 更正原因（非空，已去除首尾空白） */
+  reason: string;
+  /**
+   * 全局稠密提交顺序：从 1 起，按「使用记录 + 更正凭证」的写入先后连续编号。
+   * 同一批次重放时，按它把凭证插入对应序号的使用记录之间。
+   */
+  seq: number;
+  /** 提交时间（ISO 8601） */
+  createdAt: string;
+}
+
 export interface LedgerState {
   batches: ChemicalBatch[];
   records: UsageRecord[];
+  /**
+   * 容量更正凭证（按提交顺序追加）。
+   * 旧版本状态没有该字段，领域函数一律兼容（视同空数组）；
+   * 经持久化层读回的状态恒带该字段。
+   */
+  corrections?: CapacityCorrection[];
 }
 
-export const EMPTY_LEDGER: LedgerState = { batches: [], records: [] };
+export const EMPTY_LEDGER: LedgerState = { batches: [], records: [], corrections: [] };
+
+/** 该批全部更正凭证，按提交顺序排列（兼容无 corrections 字段的旧状态）。 */
+export function batchCorrections(state: LedgerState, batchId: string): CapacityCorrection[] {
+  return (state.corrections ?? []).filter((correction) => correction.batchId === batchId);
+}
 
 /** 命令依赖：时间与 id 生成器可注入，便于测试复现。 */
 export interface LedgerDeps {
@@ -192,6 +236,26 @@ export function validateFilmsInput(raw: string): string | undefined {
   return undefined;
 }
 
+/** 更正原因校验：空（含纯空白）不允许——凭证必须能追溯为何更正。 */
+export function validateCorrectionReason(reason: string): string | undefined {
+  if (reason.trim() === '') return '请输入容量更正原因';
+  return undefined;
+}
+
+/**
+ * 更正后的新有效容量校验：可精确表示的正整数。
+ * 「不得低于该批已登记用量」由 correctCapacity 在命令内结合最新台账判定
+ * （界面输入阶段拿不到最新用量，且跨标签并发下用量可能已变化）。
+ */
+export function validateCorrectionCapacityInput(raw: string): string | undefined {
+  if (raw.trim() === '') return '请输入新的有效容量';
+  if (isUnsafeDigits(raw)) return INTEGER_TOO_LARGE_MESSAGE;
+  const value = parseStrictInteger(raw);
+  if (value === null) return '新容量必须为整数，不能含小数或字母';
+  if (value <= 0) return '新容量须为大于 0 的整数';
+  return undefined;
+}
+
 /** 某批次已登记用量之和（累计用量）。 */
 export function usedCapacity(state: LedgerState, batchId: string): number {
   return state.records
@@ -199,9 +263,21 @@ export function usedCapacity(state: LedgerState, batchId: string): number {
     .reduce((sum, record) => sum + record.films, 0);
 }
 
-/** 某批次当前剩余容量 = 额定容量 − 累计用量。 */
+/**
+ * 某批次当前**有效容量**：创建容量 + 该批全部更正凭证的差额。
+ * 无更正凭证时恒等于批次创建容量；调增 / 调减只体现在凭证里，
+ * 批次自身的创建容量（batch.capacity）永不改变。
+ */
+export function effectiveCapacity(batch: ChemicalBatch, state: LedgerState): number {
+  return batchCorrections(state, batch.id).reduce(
+    (capacity, correction) => capacity + (correction.newCapacity - correction.previousCapacity),
+    batch.capacity,
+  );
+}
+
+/** 某批次当前剩余容量 = 有效容量 − 累计用量。 */
 export function remainingCapacity(batch: ChemicalBatch, state: LedgerState): number {
-  return batch.capacity - usedCapacity(state, batch.id);
+  return effectiveCapacity(batch, state) - usedCapacity(state, batch.id);
 }
 
 /**
@@ -221,35 +297,102 @@ export function batchRecords(state: LedgerState, batchId: string): UsageRecord[]
 /**
  * 容量轨迹一致性校验（持久化读取的最终闸门）。
  *
- * 批次选择、历史余量、耗尽判断与后续写入都依据同一份容量轨迹：
- * 「剩余量 = 额定容量 − 已登记用量之和」，逐条记录重放可完整还原。
- * 因此一份可信台账必须满足：
- * - 批次 id 唯一：记录按 batchId 归属，同 id 的两个批次会让同一组
- *   使用记录被分别套到两个额定容量上，药液归属无法确认；
- * - 按存储顺序逐条重放每批记录时，任一时刻累计用量都不超过额定容量
- *   （剩余量永不为负，不存在「已超用却仍显示使用中」的批次）；
- * - 每条记录的 remainingAfter 等于重放到该条时的剩余量，
- *   否则历史明细与批次汇总互相矛盾，整份台账失去可追溯性。
+ * 批次选择、历史余量、耗尽判断与后续写入都依据同一份容量轨迹。
+ * 更正凭证出现后，容量随时间分阶段变化，因此必须按
+ * **「凭证与用量实际发生顺序」分阶段重放**，不能拿最终容量反验早期记录：
+ * 例如批次创建容量 10、登记 8 后把容量调减为 8，
+ * 早期记录的 remainingAfter 必须按 10 − 8 = 2 验证，而不是 8 − 8 = 0。
  *
- * 命令（createBatch / recordUsage）产出的状态恒满足本校验；
+ * 事件顺序由凭证的全局稠密提交序号 seq（在「使用记录 + 更正凭证」
+ * 的写入先后中从 1 连续编号）唯一确定：全局顺序中使用记录按其数组下标
+ * 依次占位、凭证按 seq 占位。于是一份可信台账必须满足：
+ * - 批次 id 唯一：记录 / 凭证按 batchId 归属，同 id 的两个批次会让同一组
+ *   事件被分别套到多个容量上，药液归属无法确认；
+ * - 每条使用记录与每张凭证都挂在已知批次上；
+ * - 凭证 seq 互不相同，且恰好覆盖「跳过记录下标后」的全部位置
+ *   （1..(记录数 + 凭证数) 中由凭证占据的那些位置）——提交顺序断裂或重号
+ *   会让凭证与用量的先后无法确定；
+ * - 分阶段重放每批事件：凭证签发时的原有效容量必须与其记录的 previousCapacity
+ *   一致，新有效容量不得低于截至签发时该批已登记用量（余量不得为负）；
+ *   使用记录在其所处阶段不得超过当时有效容量，且 remainingAfter 必须等于
+ *   按该阶段容量重放出的剩余量。
+ *
+ * 命令（createBatch / recordUsage / correctCapacity）产出的状态恒满足本校验；
  * 不满足的存档视为不可信：不得加载为可写台账，也不得被普通操作覆盖。
  */
 export function hasConsistentCapacityTrajectory(state: LedgerState): boolean {
-  const remainingByBatchId = new Map<string, number>();
+  const corrections = state.corrections ?? [];
+  const eventCount = state.records.length + corrections.length;
+
+  // 批次 id 唯一，并初始化每批的阶段容量（创建容量）
+  const capacityByBatchId = new Map<string, number>();
   for (const batch of state.batches) {
-    if (remainingByBatchId.has(batch.id)) return false;
-    remainingByBatchId.set(batch.id, batch.capacity);
+    if (capacityByBatchId.has(batch.id)) return false;
+    capacityByBatchId.set(batch.id, batch.capacity);
   }
+
+  // 使用记录与凭证必须挂在已知批次上
   for (const record of state.records) {
-    const remaining = remainingByBatchId.get(record.batchId);
-    // 记录挂在未知批次上（存储层已先行校验，此处为双保险）
-    if (remaining === undefined) return false;
-    const next = remaining - record.films;
-    // 超额：累计用量超过额定容量，剩余量为负
-    if (next < 0) return false;
-    // 登记后剩余量与重放轨迹不符
-    if (record.remainingAfter !== next) return false;
-    remainingByBatchId.set(record.batchId, next);
+    if (!capacityByBatchId.has(record.batchId)) return false;
+  }
+  for (const correction of corrections) {
+    if (!capacityByBatchId.has(correction.batchId)) return false;
+  }
+
+  // 把使用记录（按数组下标）与凭证（按 seq）合并为全局提交顺序：
+  // 位置 1..eventCount 中，凭证按其稠密 seq 占位，其余位置由记录依次占位。
+  // seq 重号、倒退、越界或断裂都会让合并无法对齐，整份台账不可信。
+  type Event =
+    | { kind: 'record'; record: UsageRecord }
+    | { kind: 'correction'; correction: CapacityCorrection };
+  const events: Event[] = [];
+  let recordCursor = 0;
+  let correctionCursor = 0;
+  for (let position = 1; position <= eventCount; position += 1) {
+    const nextCorrection = corrections[correctionCursor];
+    if (nextCorrection && nextCorrection.seq === position) {
+      events.push({ kind: 'correction', correction: nextCorrection });
+      correctionCursor += 1;
+    } else if (nextCorrection && nextCorrection.seq < position) {
+      // seq 重号 / 倒退 / 非正整数：提交顺序无法对齐
+      return false;
+    } else if (recordCursor < state.records.length) {
+      events.push({ kind: 'record', record: state.records[recordCursor] });
+      recordCursor += 1;
+    } else {
+      // 记录已取完但位置仍对不上下一张凭证：顺序断裂
+      return false;
+    }
+  }
+
+  // 按全局提交顺序重放：每批只消费归属自己的事件，相对先后与全局一致。
+  // usedByBatchId 记录各批截至当前事件已登记用量；阶段容量随凭证变化。
+  const usedByBatchId = new Map<string, number>(
+    [...capacityByBatchId.keys()].map((id) => [id, 0]),
+  );
+  for (const event of events) {
+    if (event.kind === 'correction') {
+      const { correction } = event;
+      const capacity = capacityByBatchId.get(correction.batchId)!;
+      const used = usedByBatchId.get(correction.batchId)!;
+      // 凭证签发时的原有效容量必须与其所处阶段的重放值一致：
+      // 不能拿最终容量或其它阶段容量冒充「原值」。
+      if (correction.previousCapacity !== capacity) return false;
+      // 新有效容量不得低于截至签发时已登记用量：不允许把已登记用量改成超额。
+      if (correction.newCapacity < used) return false;
+      capacityByBatchId.set(correction.batchId, correction.newCapacity);
+      continue;
+    }
+
+    const { record } = event;
+    const capacity = capacityByBatchId.get(record.batchId)!;
+    const used = usedByBatchId.get(record.batchId)!;
+    const nextRemaining = capacity - (used + record.films);
+    // 超额：该阶段累计用量超过当时有效容量，剩余量为负
+    if (nextRemaining < 0) return false;
+    // 登记后剩余量必须等于按该阶段容量重放的值，而不是用最终容量反推
+    if (record.remainingAfter !== nextRemaining) return false;
+    usedByBatchId.set(record.batchId, used + record.films);
   }
   return true;
 }
@@ -318,9 +461,10 @@ export interface RecordUsageInput {
 
 /**
  * 命令二：登记一次处理用量。
- * 写入前重新计算剩余量（额定容量 − 已登记用量之和）：
- * 数量为空 / 非整数 / 非正整数 / 超过剩余容量时返回原因，不写入记录；
- * 成功后追加一条不可修改的使用记录，remainingAfter 记录登记后的剩余容量。
+ * 写入前按最新有效容量重新计算剩余量（有效容量 − 已登记用量之和）：
+ * 数量为空 / 非整数 / 非正整数 / 超过当前剩余容量时返回原因，不写入记录；
+ * 成功后追加一条不可修改的使用记录，remainingAfter 记录其所处容量阶段登记后的剩余容量
+ * （历史快照，之后的容量更正不会回改它）。
  */
 export function recordUsage(
   state: LedgerState,
@@ -355,5 +499,75 @@ export function recordUsage(
     ok: true,
     value: record,
     state: { ...state, records: [...state.records, record] },
+  };
+}
+
+export interface CorrectCapacityInput {
+  batchId: string;
+  /** 表单原始字符串：新的有效容量，由命令内部校验 */
+  newCapacity: string;
+  /** 更正原因（必填，命令内部去除首尾空白并校验非空） */
+  reason: string;
+}
+
+/**
+ * 命令三：追加一张不可修改的「容量更正凭证」。
+ *
+ * 用于登记时发现批次的额定可处理胶片数写错的情形：
+ * - 不修改批次的创建容量（batch.capacity），也不重写任何历史使用记录
+ *   （含其 remainingAfter 快照）——只追加凭证；
+ * - 新容量须为正的安全整数，且不得低于该批截至提交时的已登记用量
+ *   （否则会把既有登记变成超额、余量变负，凭证连同原因一起被拒绝）；
+ * - 与当前有效容量相同的「无变化更正」同样拒绝，不产生空凭证、不推进修订号；
+ * - seq 取「使用记录 + 更正凭证」的下一个全局提交位置（稠密、连续），
+ *   存档校验据此把凭证精确插回用量之间分阶段重放。
+ *
+ * 成功后的后续登记按新的有效容量计算余量；凭证本身与使用记录一样冻结、
+ * 只追加，界面不提供编辑或删除入口。
+ */
+export function correctCapacity(
+  state: LedgerState,
+  input: CorrectCapacityInput,
+  deps: LedgerDeps,
+): CommandResult<CapacityCorrection> {
+  const batch = state.batches.find((candidate) => candidate.id === input.batchId);
+  if (!batch) {
+    return { ok: false, error: '批次不存在或已被移除' };
+  }
+  const reasonError = validateCorrectionReason(input.reason);
+  if (reasonError) return { ok: false, error: reasonError };
+  const capacityError = validateCorrectionCapacityInput(input.newCapacity);
+  if (capacityError) return { ok: false, error: capacityError };
+
+  const newCapacityValue = parseStrictInteger(input.newCapacity)!;
+  // 命令在最新台账上重放：以最新有效容量与最新累计用量为准，
+  // 绝不依据界面上可能已过期的余量。
+  const previousCapacity = effectiveCapacity(batch, state);
+  const used = usedCapacity(state, batch.id);
+  if (newCapacityValue < used) {
+    return {
+      ok: false,
+      error: `新有效容量不得低于该批已登记用量：已登记 ${used}，无法更正为 ${newCapacityValue}`,
+    };
+  }
+  if (newCapacityValue === previousCapacity) {
+    return { ok: false, error: '新有效容量与当前有效容量相同，无需更正' };
+  }
+
+  const corrections = state.corrections ?? [];
+  const correction: CapacityCorrection = Object.freeze({
+    id: deps.nextId(),
+    batchId: batch.id,
+    previousCapacity,
+    newCapacity: newCapacityValue,
+    reason: input.reason.trim(),
+    // 全局稠密提交顺序：凭证与使用记录共享同一条提交位置序列
+    seq: state.records.length + corrections.length + 1,
+    createdAt: deps.now().toISOString(),
+  });
+  return {
+    ok: true,
+    value: correction,
+    state: { ...state, corrections: [...corrections, correction] },
   };
 }
