@@ -145,6 +145,7 @@ describe('容量台账持久化', () => {
         },
       ],
       records: good.records,
+      corrections: good.corrections,
     };
     expect(parseLedger(JSON.stringify(dirty))).toBeNull();
     saveLedger(storage, dirty);
@@ -271,6 +272,7 @@ describe('容量轨迹一致性（异常存档与合法旧档）', () => {
       records: good.records.map((record, index) =>
         index === 0 ? { ...record, remainingAfter: record.remainingAfter + 1 } : record,
       ),
+      corrections: [],
     };
     expect(hasConsistentCapacityTrajectory(dirty)).toBe(false);
     saveLedger(storage, dirty);

@@ -329,9 +329,18 @@ describe('hasConsistentCapacityTrajectory 容量轨迹校验', () => {
     return { id, batchId, films, note: '', remainingAfter, createdAt: '2026-09-02T09:00:00.000Z' };
   }
 
+  /** 手工组装状态（无更正凭证），供轨迹校验的异常构造使用。 */
+  function stateWith(
+    batches: ChemicalBatch[],
+    records: LedgerState['records'],
+    corrections: LedgerState['corrections'] = [],
+  ): LedgerState {
+    return { batches, records, corrections };
+  }
+
   it('空台账与无记录批次可信', () => {
     expect(hasConsistentCapacityTrajectory(EMPTY_LEDGER)).toBe(true);
-    expect(hasConsistentCapacityTrajectory({ batches: [batch('b1', 10)], records: [] })).toBe(true);
+    expect(hasConsistentCapacityTrajectory(stateWith([batch('b1', 10)], []))).toBe(true);
   });
 
   it('命令产出的状态恒可信：跨批次交错记录也按各自轨迹重放', () => {
@@ -349,44 +358,34 @@ describe('hasConsistentCapacityTrajectory 容量轨迹校验', () => {
   });
 
   it('同 id 批次不可信：同一组记录的归属无法确认', () => {
-    const state: LedgerState = {
-      batches: [batch('dup', 10), batch('dup', 20)],
-      records: [record('r1', 'dup', 4, 6)],
-    };
+    const state = stateWith([batch('dup', 10), batch('dup', 20)], [record('r1', 'dup', 4, 6)]);
     expect(hasConsistentCapacityTrajectory(state)).toBe(false);
   });
 
   it('累计用量超过额定容量（负余量）不可信', () => {
-    const state: LedgerState = {
-      batches: [batch('b1', 5)],
-      records: [record('r1', 'b1', 4, 1), record('r2', 'b1', 3, 0)],
-    };
+    const state = stateWith(
+      [batch('b1', 5)],
+      [record('r1', 'b1', 4, 1), record('r2', 'b1', 3, 0)],
+    );
     expect(hasConsistentCapacityTrajectory(state)).toBe(false);
   });
 
   it('登记后剩余量与累计轨迹不符不可信（含中间某条不符）', () => {
     // 单条即矛盾：10 − 3 = 7 ≠ 5
     expect(
-      hasConsistentCapacityTrajectory({
-        batches: [batch('b1', 10)],
-        records: [record('r1', 'b1', 3, 5)],
-      }),
+      hasConsistentCapacityTrajectory(stateWith([batch('b1', 10)], [record('r1', 'b1', 3, 5)])),
     ).toBe(false);
     // 前一条一致、后一条矛盾：10 − 3 = 7 ✓，7 − 2 = 5 ≠ 4 ✗
     expect(
-      hasConsistentCapacityTrajectory({
-        batches: [batch('b1', 10)],
-        records: [record('r1', 'b1', 3, 7), record('r2', 'b1', 2, 4)],
-      }),
+      hasConsistentCapacityTrajectory(
+        stateWith([batch('b1', 10)], [record('r1', 'b1', 3, 7), record('r2', 'b1', 2, 4)]),
+      ),
     ).toBe(false);
   });
 
   it('记录挂在未知批次上不可信', () => {
     expect(
-      hasConsistentCapacityTrajectory({
-        batches: [batch('b1', 10)],
-        records: [record('r1', 'ghost', 1, 9)],
-      }),
+      hasConsistentCapacityTrajectory(stateWith([batch('b1', 10)], [record('r1', 'ghost', 1, 9)])),
     ).toBe(false);
   });
 });

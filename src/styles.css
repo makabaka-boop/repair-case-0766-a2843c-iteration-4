@@ -266,6 +266,42 @@ header h1 {
   font-style: normal;
 }
 
+.capacity-note {
+  color: var(--muted);
+  font-style: normal;
+  font-size: 13px;
+}
+
+.correction-list {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+}
+
+.correction-item {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  align-items: baseline;
+  padding: 8px 4px;
+  border-bottom: 1px dashed var(--panel-border);
+}
+
+.correction-item:last-child {
+  border-bottom: none;
+}
+
+.correction-item__time {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.correction-item__reason {
+  margin-left: auto;
+  color: var(--muted);
+  font-style: normal;
+}
+
 .panel {
   background: var(--panel);
   border: 1px solid var(--panel-border);

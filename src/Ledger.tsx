@@ -1,13 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   BATCH_STATUS_LABEL,
+  batchCorrections,
   batchRecords,
   batchStatus,
+  effectiveCapacity,
   remainingCapacity,
   usedCapacity,
   validateBatchName,
   validateCapacityInput,
+  validateCorrectionReason,
   validateFilmsInput,
+  validateNewCapacityInput,
 } from './lib/capacityLedger';
 import type { CommitOutcome, LedgerDocument, LedgerIntent } from './lib/ledgerStorage';
 
@@ -32,14 +36,19 @@ export interface LedgerProps {
 }
 
 /**
- * 容量台账视图：创建药液批次 → 选中批次登记用量 → 按时间查看使用记录。
+ * 容量台账视图：创建药液批次 → 选中批次登记用量 / 更正容量 →
+ * 按时间查看使用记录与容量更正凭证。
  *
  * 所有写入都经过 onCommit（乐观并发提交）：
- * - 领域规则拒绝（非法输入、超剩余容量）→ 对应字段下方就地说明，不写存储；
+ * - 领域规则拒绝（非法输入、超剩余容量、新容量低于已登记用量、更正原因为空）→
+ *   对应字段下方就地说明，不写存储；
  * - 其他页面已提交（修订号冲突）或 localStorage 写入失败 →
- *   顶部就地说明，本次动作不记账，界面回显存储中的最后完整台账；
+ *   顶部就地说明，本次动作不记账，界面回显存储中的最后完整台账，
+ *   绝不显示没有落账的「新增余量」；
  * - 其他标签页写入后，App 通过 storage 事件把最新台账推送到本视图，
- *   批次状态与剩余量自动刷新，无需手动重载。
+ *   有效容量、批次状态与剩余量自动刷新，无需手动重载。
+ * 批次列表、详情余量、耗尽判断与历史明细共享同一个有效容量
+ * （effectiveCapacity：无凭证时即创建容量）。
  */
 export default function Ledger({ doc, onCommit, selectedId, onSelectBatch, storageCorrupted }: LedgerProps) {
   const ledger = doc.ledger;
@@ -55,6 +64,12 @@ export default function Ledger({ doc, onCommit, selectedId, onSelectBatch, stora
   const [note, setNote] = useState('');
   const [filmsError, setFilmsError] = useState<string | null>(null);
 
+  // 容量更正凭证表单（选中批次后可见）
+  const [newCapacity, setNewCapacity] = useState('');
+  const [reason, setReason] = useState('');
+  const [newCapacityError, setNewCapacityError] = useState<string | null>(null);
+  const [reasonError, setReasonError] = useState<string | null>(null);
+
   // 冲突 / 存储失败等动作级错误（不属于单个输入字段）
   const [commitError, setCommitError] = useState<string | null>(null);
   // 最近一次「失败后对齐到的修订号」：此时 revision 变化是本次失败的结果，
@@ -63,6 +78,7 @@ export default function Ledger({ doc, onCommit, selectedId, onSelectBatch, stora
 
   const selected = ledger.batches.find((batch) => batch.id === selectedId) ?? null;
   const selectedRecords = selected ? batchRecords(ledger, selected.id) : [];
+  const selectedCorrections = selected ? batchCorrections(ledger, selected.id) : [];
 
   // 外部标签页写入（storage 事件）导致文档变化时，清掉已失效的动作级提示；
   // 但要跳过「本组件一次失败提交把视图对齐到最新文档」引发的同一次变化，
@@ -80,6 +96,11 @@ export default function Ledger({ doc, onCommit, selectedId, onSelectBatch, stora
     setFilms('');
     setNote('');
     setFilmsError(null);
+    // 容量更正草稿同样随选中批次丢弃，避免把 A 批的更正误提交到 B 批
+    setNewCapacity('');
+    setReason('');
+    setNewCapacityError(null);
+    setReasonError(null);
   }, [selectedKey]);
 
   const submitCreate = (event: React.FormEvent<HTMLFormElement>) => {
@@ -140,6 +161,44 @@ export default function Ledger({ doc, onCommit, selectedId, onSelectBatch, stora
     // 冲突 / 存储失败 / 损坏：本次用量未记账。
     // 冲突时界面已随最新文档刷新（剩余量、记录列表都是最新）；
     // 存储失败时文档保持最后完整台账，输入保留，操作员可重试或放弃。
+    failedAtRevision.current = outcome.doc.revision;
+    setCommitError(outcome.error);
+  };
+
+  const submitCorrection = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selected) return;
+    const capacityErr = validateNewCapacityInput(newCapacity);
+    const reasonErr = validateCorrectionReason(reason);
+    setNewCapacityError(capacityErr ?? null);
+    setReasonError(reasonErr ?? null);
+    setCommitError(null);
+    if (capacityErr || reasonErr) return;
+
+    const outcome = onCommit({
+      type: 'correctCapacity',
+      input: { batchId: selected.id, newCapacity, reason },
+    });
+    if (outcome.ok) {
+      // 凭证落账：有效容量与余量随新文档刷新；清空草稿，不保留任何「待生效」余量
+      setNewCapacity('');
+      setReason('');
+      setNewCapacityError(null);
+      setReasonError(null);
+      setCommitError(null);
+      return;
+    }
+    if (outcome.kind === 'rejected') {
+      const result = outcome.intent.result;
+      if (!result.ok) {
+        // 「低于已登记用量」是容量字段的命令级错误；批次不存在等其他原因走顶部提示
+        if (result.error.startsWith('新有效容量')) setNewCapacityError(result.error);
+        else setCommitError(result.error);
+      }
+      return;
+    }
+    // 冲突 / 存储失败 / 损坏：凭证未追加，界面绝不显示没有落账的新余量。
+    // 冲突时视图对齐最新文档；存储失败时保持最后完整台账，草稿保留便于重试。
     failedAtRevision.current = outcome.doc.revision;
     setCommitError(outcome.error);
   };
@@ -226,6 +285,8 @@ export default function Ledger({ doc, onCommit, selectedId, onSelectBatch, stora
             {ledger.batches.map((batch) => {
               const status = batchStatus(batch, ledger);
               const isSelected = batch.id === selectedId;
+              const effective = effectiveCapacity(ledger, batch);
+              const corrected = effective !== batch.capacity;
               return (
                 <li key={batch.id}>
                   <button
@@ -248,7 +309,14 @@ export default function Ledger({ doc, onCommit, selectedId, onSelectBatch, stora
                       　剩余 <strong data-testid="batch-remaining">
                         {remainingCapacity(batch, ledger)}
                       </strong>
-                      　额定 <span data-testid="batch-capacity">{batch.capacity}</span>
+                      　有效{' '}
+                      <strong data-testid="batch-capacity">{effective}</strong>
+                      {corrected && (
+                        <em className="capacity-note" data-testid="batch-capacity-corrected">
+                          {' '}
+                          （创建 {batch.capacity}）
+                        </em>
+                      )}
                     </span>
                   </button>
                 </li>
@@ -269,6 +337,14 @@ export default function Ledger({ doc, onCommit, selectedId, onSelectBatch, stora
             <div>
               <dt>剩余容量</dt>
               <dd data-testid="detail-remaining">{remainingCapacity(selected, ledger)}</dd>
+            </div>
+            <div>
+              <dt>创建容量</dt>
+              <dd data-testid="detail-created-capacity">{selected.capacity}</dd>
+            </div>
+            <div>
+              <dt>有效容量</dt>
+              <dd data-testid="detail-effective-capacity">{effectiveCapacity(ledger, selected)}</dd>
             </div>
             <div>
               <dt>状态</dt>
@@ -355,6 +431,99 @@ export default function Ledger({ doc, onCommit, selectedId, onSelectBatch, stora
               ))}
             </ol>
           )}
+
+          <h3 className="records-title">容量更正凭证</h3>
+          <p className="note">
+            凭证只追加、不可修改：创建容量与历史记录的登记后剩余量保持原样，
+            后续余量与新登记按最新有效容量计算；新有效容量不得低于已登记用量
+            （当前 {usedCapacity(ledger, selected.id)}）。
+          </p>
+          {selectedCorrections.length === 0 ? (
+            <p className="note" data-testid="correction-empty">
+              暂无容量更正凭证，有效容量等于创建容量。
+            </p>
+          ) : (
+            <ol className="correction-list" data-testid="correction-list">
+              {selectedCorrections.map((correction) => (
+                <li key={correction.id} className="correction-item" data-testid="correction-item">
+                  <span className="correction-item__time" data-testid="correction-time">
+                    {formatTime(correction.createdAt)}
+                  </span>
+                  <span data-testid="correction-sequence">第 {correction.sequence} 次更正</span>
+                  <span>
+                    容量 <strong data-testid="correction-from">{correction.fromCapacity}</strong> →{' '}
+                    <strong data-testid="correction-to">{correction.toCapacity}</strong>
+                  </span>
+                  <em className="correction-item__reason" data-testid="correction-reason">
+                    原因：{correction.reason}
+                  </em>
+                </li>
+              ))}
+            </ol>
+          )}
+
+          <form onSubmit={submitCorrection} noValidate>
+            <div className="fields">
+              <div className={`field${newCapacityError ? ' field--invalid' : ''}`}>
+                <label htmlFor="new-capacity-input">新有效容量（等效胶片数）</label>
+                <input
+                  id="new-capacity-input"
+                  data-testid="new-capacity-input"
+                  inputMode="numeric"
+                  value={newCapacity}
+                  onChange={(event) => {
+                    setNewCapacity(event.target.value);
+                    setNewCapacityError(null);
+                  }}
+                  aria-invalid={Boolean(newCapacityError)}
+                  aria-describedby="error-new-capacity new-capacity-hint"
+                />
+                <small id="new-capacity-hint" className="hint">
+                  正整数，且不得低于该批已登记用量 {usedCapacity(ledger, selected.id)}
+                </small>
+                {newCapacityError && (
+                  <p
+                    className="error"
+                    role="alert"
+                    id="error-new-capacity"
+                    data-testid="error-new-capacity"
+                  >
+                    {newCapacityError}
+                  </p>
+                )}
+              </div>
+              <div className={`field${reasonError ? ' field--invalid' : ''}`}>
+                <label htmlFor="correction-reason-input">更正原因</label>
+                <input
+                  id="correction-reason-input"
+                  data-testid="correction-reason-input"
+                  value={reason}
+                  onChange={(event) => {
+                    setReason(event.target.value);
+                    setReasonError(null);
+                  }}
+                  aria-invalid={Boolean(reasonError)}
+                  aria-describedby="error-correction-reason correction-reason-hint"
+                />
+                <small id="correction-reason-hint" className="hint">
+                  如：建档时容量登记错误，实测可处理 16 卷
+                </small>
+                {reasonError && (
+                  <p
+                    className="error"
+                    role="alert"
+                    id="error-correction-reason"
+                    data-testid="error-correction-reason"
+                  >
+                    {reasonError}
+                  </p>
+                )}
+              </div>
+            </div>
+            <button type="submit" className="action-button" data-testid="correct-capacity-button">
+              提交容量更正凭证
+            </button>
+          </form>
         </section>
       )}
     </>
